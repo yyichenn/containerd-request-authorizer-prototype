@@ -25,6 +25,8 @@ import (
 	"testing"
 
 	srvconfig "github.com/containerd/containerd/v2/cmd/containerd/server/config"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/containerd/v2/version"
 	"github.com/containerd/plugin"
 	"github.com/containerd/plugin/registry"
@@ -33,6 +35,31 @@ import (
 )
 
 const testPath = "/tmp/path/for/testing"
+
+func TestLoadRequestAuthorizerProxyPlugin(t *testing.T) {
+	registry.Reset()
+	defer registry.Reset()
+
+	loaded, err := LoadPlugins(context.Background(), &srvconfig.Config{
+		ProxyPlugins: map[string]srvconfig.ProxyPlugin{
+			"aws-rfc9421": {
+				Type:    "request-authorizer",
+				Address: "/run/containerd/aws-rfc9421.sock",
+			},
+		},
+	})
+	assert.NoError(t, err)
+	assert.Len(t, loaded, 1)
+	assert.Equal(t, plugins.RequestAuthorizerPlugin, loaded[0].Type)
+	assert.Equal(t, "aws-rfc9421", loaded[0].ID)
+
+	initialized := plugin.NewPluginSet()
+	result := loaded[0].Init(plugin.NewContext(context.Background(), initialized, nil))
+	instance, err := result.Instance()
+	assert.NoError(t, err)
+	_, ok := instance.(docker.MessageSigner)
+	assert.True(t, ok)
+}
 
 func TestCreateTopLevelDirectoriesErrorsWithSamePathForRootAndState(t *testing.T) {
 	path := testPath

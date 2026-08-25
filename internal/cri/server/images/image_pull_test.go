@@ -17,22 +17,36 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"testing"
 	"time"
 
+	distribution "github.com/distribution/reference"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"github.com/containerd/platforms"
 
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/transfer"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	"github.com/containerd/containerd/v2/internal/cri/labels"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
+
+type testRequestAuthorizerSigner struct{}
+
+func (testRequestAuthorizerSigner) NewSigningContext(context.Context, time.Time, []byte) (docker.SigningContext, error) {
+	return nil, nil
+}
+
+func (testRequestAuthorizerSigner) Sign(context.Context, docker.SigningContext, []byte) ([]byte, error) {
+	return nil, nil
+}
 
 func TestParseAuth(t *testing.T) {
 	testUser := "username"
@@ -123,6 +137,79 @@ func TestParseAuth(t *testing.T) {
 			assert.Equal(t, test.expectedSecret, s)
 		})
 	}
+}
+
+func TestParseRequestAuthorizer(t *testing.T) {
+	credentialContext := []byte("pod-identity-handle")
+	auth := &runtime.AuthConfig{
+		RequestAuthorizer: &runtime.RequestAuthorizer{
+			Name:              " aws-rfc9421 ",
+			CredentialContext: credentialContext,
+		},
+	}
+
+	encoded, err := proto.Marshal(auth)
+	assert.NoError(t, err)
+	var decoded runtime.AuthConfig
+	assert.NoError(t, proto.Unmarshal(encoded, &decoded))
+
+	requestAuthorizer, err := parseRequestAuthorizer(&decoded)
+	assert.NoError(t, err)
+	assert.Equal(t, "aws-rfc9421", requestAuthorizer.Name)
+	assert.Equal(t, credentialContext, requestAuthorizer.CredentialContext)
+
+	decoded.RequestAuthorizer.CredentialContext[0] = 'X'
+	assert.Equal(t, credentialContext, requestAuthorizer.CredentialContext)
+}
+
+func TestParseRequestAuthorizerRejectsMixedCredentials(t *testing.T) {
+	_, err := parseRequestAuthorizer(&runtime.AuthConfig{
+		Username: "AWS",
+		RequestAuthorizer: &runtime.RequestAuthorizer{
+			Name: "aws-rfc9421",
+		},
+	})
+	assert.ErrorContains(t, err, "mutually exclusive")
+}
+
+func TestParseRequestAuthorizerRejectsLargeContext(t *testing.T) {
+	_, err := parseRequestAuthorizer(&runtime.AuthConfig{
+		RequestAuthorizer: &runtime.RequestAuthorizer{
+			Name:              "aws-rfc9421",
+			CredentialContext: bytes.Repeat([]byte{'x'}, maxCredentialContextSize+1),
+		},
+	})
+	assert.ErrorContains(t, err, "exceeds")
+}
+
+func TestRequestSigningOptionsSelectsExactPlugin(t *testing.T) {
+	signer := testRequestAuthorizerSigner{}
+	service := &CRIImageService{
+		requestAuthorizers: map[string]docker.MessageSigner{
+			"aws-rfc9421": signer,
+		},
+	}
+	namedRef, err := distribution.ParseDockerRef(
+		"123456789012.dkr.ecr.us-east-1.amazonaws.com/repository:latest",
+	)
+	assert.NoError(t, err)
+
+	options, err := service.requestSigningOptions(namedRef, &RequestAuthorizerConfig{
+		Name:              "aws-rfc9421",
+		CredentialContext: []byte("pod-identity-handle"),
+	})
+	assert.NoError(t, err)
+	assert.Equal(
+		t,
+		[]string{"123456789012.dkr.ecr.us-east-1.amazonaws.com"},
+		options.Hosts,
+	)
+	assert.Equal(t, []byte("pod-identity-handle"), options.CredentialContext)
+
+	_, err = service.requestSigningOptions(namedRef, &RequestAuthorizerConfig{
+		Name: "not-configured",
+	})
+	assert.ErrorContains(t, err, "not configured")
 }
 
 func TestRegistryEndpoints(t *testing.T) {

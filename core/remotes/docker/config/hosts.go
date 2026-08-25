@@ -21,6 +21,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -69,13 +71,66 @@ type HostOptions struct {
 	// UpdateClient will be called after creating http.Client object, so clients can provide extra configuration
 	UpdateClient   UpdateClientFunc
 	AuthorizerOpts []docker.AuthorizerOpt
+	// RequestSigning selects RFC 9421 request signing for exact registry hosts.
+	// If nil, the prototype reads CONTAINERD_REGISTRY_RFC9421_HOSTS and
+	// CONTAINERD_REGISTRY_RFC9421_REGION.
+	RequestSigning *RequestSigningOptions
 }
+
+// RequestSigningOptions configures request-bound registry authentication.
+type RequestSigningOptions struct {
+	Hosts             []string
+	Signer            docker.MessageSigner
+	SignerSocket      string
+	CredentialContext []byte
+}
+
+const (
+	rfc9421HostsEnv        = "CONTAINERD_REGISTRY_RFC9421_HOSTS"
+	rfc9421SignerSocketEnv = "CONTAINERD_REGISTRY_RFC9421_SIGNER_SOCKET"
+)
 
 // ConfigureHosts creates a registry hosts function from the provided
 // host creation options. The host directory can read hosts.toml or
 // certificate files laid out in the Docker specific layout.
 // If a `HostDir` function is not required, defaults are used.
 func ConfigureHosts(ctx context.Context, options HostOptions) docker.RegistryHosts {
+	requestSigning := options.RequestSigning
+	if requestSigning == nil {
+		requestSigning = requestSigningOptionsFromEnvironment()
+	}
+	requestSigningHosts := make(map[string]struct{})
+	if requestSigning != nil {
+		for _, host := range requestSigning.Hosts {
+			if normalized := strings.ToLower(strings.TrimSpace(host)); normalized != "" {
+				requestSigningHosts[normalized] = struct{}{}
+			}
+		}
+	}
+
+	var (
+		signerOnce sync.Once
+		signer     docker.MessageSigner
+		signerErr  error
+	)
+	getRequestSigner := func() (docker.MessageSigner, error) {
+		signerOnce.Do(func() {
+			if requestSigning == nil {
+				return
+			}
+			if requestSigning.Signer != nil {
+				signer = requestSigning.Signer
+				return
+			}
+			if requestSigning.SignerSocket != "" {
+				signer, signerErr = docker.NewUnixSocketMessageSigner(requestSigning.SignerSocket)
+				return
+			}
+			signerErr = errors.New("request signing requires a signer or signer socket")
+		})
+		return signer, signerErr
+	}
+
 	return func(host string) ([]docker.RegistryHost, error) {
 		var hosts []hostConfig
 		if options.HostDir != nil {
@@ -212,6 +267,24 @@ func ConfigureHosts(ctx context.Context, options HostOptions) docker.RegistryHos
 				rhosts[i].Authorizer = authorizer
 			}
 
+			if _, ok := requestSigningHosts[strings.ToLower(host.host)]; ok {
+				requestSigner, err := getRequestSigner()
+				if err != nil {
+					return nil, err
+				}
+				if requestSigner == nil {
+					return nil, fmt.Errorf("request signing is enabled for %q but no signer is configured", host.host)
+				}
+				rhosts[i].Authorizer, err = docker.NewRFC9421Authorizer(
+					host.host,
+					requestSigner,
+					docker.WithRFC9421CredentialContext(requestSigning.CredentialContext),
+				)
+				if err != nil {
+					return nil, err
+				}
+			}
+
 			// When TLS has been configured for the operation or host and
 			// the protocol from the port number is ambiguous, use the
 			// docker.NewHTTPFallback roundtripper to catch TLS errors and re-attempt the
@@ -237,6 +310,17 @@ func ConfigureHosts(ctx context.Context, options HostOptions) docker.RegistryHos
 		return rhosts, nil
 	}
 
+}
+
+func requestSigningOptionsFromEnvironment() *RequestSigningOptions {
+	hostsValue := strings.TrimSpace(os.Getenv(rfc9421HostsEnv))
+	if hostsValue == "" {
+		return nil
+	}
+	return &RequestSigningOptions{
+		Hosts:        strings.Split(hostsValue, ","),
+		SignerSocket: strings.TrimSpace(os.Getenv(rfc9421SignerSocketEnv)),
+	}
 }
 
 func updateTLSConfigFromHost(tlsConfig *tls.Config, host *hostConfig) error {

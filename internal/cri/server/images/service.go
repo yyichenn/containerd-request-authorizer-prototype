@@ -23,6 +23,7 @@ import (
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/images"
+	remotedocker "github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/transfer"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
@@ -48,6 +49,13 @@ type imageClient interface {
 type ImagePlatform struct {
 	Snapshotter string
 	Platform    imagespec.Platform
+}
+
+// RequestAuthorizerConfig selects request-bound registry authentication for
+// one pull. CredentialContext is opaque to containerd.
+type RequestAuthorizerConfig struct {
+	Name              string
+	CredentialContext []byte
 }
 
 type CRIImageService struct {
@@ -78,6 +86,9 @@ type CRIImageService struct {
 
 	// downloadLimiter is used to limit the number of concurrent downloads.
 	downloadLimiter *semaphore.Weighted
+	// requestAuthorizers contains externally configured registry request signers
+	// keyed by the exact name selected in CRI AuthConfig.
+	requestAuthorizers map[string]remotedocker.MessageSigner
 }
 
 type GRPCCRIImageService struct {
@@ -98,6 +109,8 @@ type CRIImageServiceOptions struct {
 	Client imageClient
 
 	Transferrer transfer.Transferrer
+
+	RequestAuthorizers map[string]remotedocker.MessageSigner
 }
 
 // NewService creates a new CRI Image Service
@@ -126,6 +139,7 @@ func NewService(config criconfig.ImageConfig, options *CRIImageServiceOptions) (
 		transferrer:                 options.Transferrer,
 		unpackDuplicationSuppressor: kmutex.New(),
 		downloadLimiter:             downloadLimiter,
+		requestAuthorizers:          options.RequestAuthorizers,
 	}
 
 	log.L.Info("Start snapshots syncer")

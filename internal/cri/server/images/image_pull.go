@@ -17,9 +17,11 @@
 package images
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -55,6 +57,8 @@ import (
 	snpkg "github.com/containerd/containerd/v2/pkg/snapshotters"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 )
+
+const maxCredentialContextSize = 4 << 10
 
 // For image management:
 // 1) We have an in-memory metadata index to:
@@ -101,6 +105,10 @@ import (
 func (c *GRPCCRIImageService) PullImage(ctx context.Context, r *runtime.PullImageRequest) (_ *runtime.PullImageResponse, err error) {
 
 	imageRef := r.GetImage().GetImage()
+	requestAuthorizer, err := parseRequestAuthorizer(r.GetAuth())
+	if err != nil {
+		return nil, err
+	}
 
 	credentials := func(host string) (string, string, error) {
 		hostauth := r.GetAuth()
@@ -113,14 +121,21 @@ func (c *GRPCCRIImageService) PullImage(ctx context.Context, r *runtime.PullImag
 		return ParseAuth(hostauth, host)
 	}
 
-	ref, err := c.CRIImageService.PullImage(ctx, imageRef, credentials, r.SandboxConfig, r.GetImage().GetRuntimeHandler())
+	ref, err := c.CRIImageService.PullImage(
+		ctx,
+		imageRef,
+		credentials,
+		requestAuthorizer,
+		r.SandboxConfig,
+		r.GetImage().GetRuntimeHandler(),
+	)
 	if err != nil {
 		return nil, err
 	}
 	return &runtime.PullImageResponse{ImageRef: ref}, nil
 }
 
-func (c *CRIImageService) PullImage(ctx context.Context, name string, credentials func(string) (string, string, error), sandboxConfig *runtime.PodSandboxConfig, runtimeHandler string) (_ string, err error) {
+func (c *CRIImageService) PullImage(ctx context.Context, name string, credentials func(string) (string, string, error), requestAuthorizer *RequestAuthorizerConfig, sandboxConfig *runtime.PodSandboxConfig, runtimeHandler string) (_ string, err error) {
 	span := tracing.SpanFromContext(ctx)
 	defer func() {
 		// TODO: add domain label for imagePulls metrics, and we may need to provide a mechanism
@@ -159,6 +174,13 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 	if ref != name {
 		log.G(ctx).Debugf("PullImage using normalized image ref: %q", ref)
 	}
+	requestSigning, err := c.requestSigningOptions(namedRef, requestAuthorizer)
+	if err != nil {
+		return "", err
+	}
+	if requestSigning != nil && !c.config.UseLocalImagePull {
+		return "", errors.New("request authorizers are not yet supported by the transfer-service pull path")
+	}
 
 	imagePullProgressTimeout, err := time.ParseDuration(c.config.ImagePullProgressTimeout)
 	if err != nil {
@@ -185,7 +207,7 @@ func (c *CRIImageService) PullImage(ctx context.Context, name string, credential
 		bytesPulled uint64
 	)
 	if c.config.UseLocalImagePull {
-		image, bytesPulled, err = c.pullImageWithLocalPull(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)
+		image, bytesPulled, err = c.pullImageWithLocalPull(ctx, ref, credentials, requestSigning, snapshotter, labels, imagePullProgressTimeout)
 	} else {
 		image, bytesPulled, err = c.pullImageWithTransferService(ctx, ref, credentials, snapshotter, labels, imagePullProgressTimeout)
 	}
@@ -243,6 +265,7 @@ func (c *CRIImageService) pullImageWithLocalPull(
 	ctx context.Context,
 	ref string,
 	credentials func(string) (string, string, error),
+	requestSigning *config.RequestSigningOptions,
 	snapshotter string,
 	labels map[string]string,
 	imagePullProgressTimeout time.Duration,
@@ -252,7 +275,7 @@ func (c *CRIImageService) pullImageWithLocalPull(
 	pullReporter := newPullProgressReporter(ref, pcancel, imagePullProgressTimeout)
 	resolver := docker.NewResolver(docker.ResolverOptions{
 		Headers: c.config.Registry.Headers,
-		Hosts:   c.registryHosts(ctx, credentials, pullReporter.optionUpdateClient),
+		Hosts:   c.registryHosts(ctx, credentials, requestSigning, pullReporter.optionUpdateClient),
 	})
 
 	log.G(ctx).Debugf("PullImage %q with snapshotter %s using client.Pull()", ref, snapshotter)
@@ -348,6 +371,52 @@ func (c *CRIImageService) pullImageWithTransferService(
 	}
 	_, bytesPulled := transferProgressReporter.reqReporter.status()
 	return image, bytesPulled, nil
+}
+
+func parseRequestAuthorizer(auth *runtime.AuthConfig) (*RequestAuthorizerConfig, error) {
+	if auth == nil || auth.GetRequestAuthorizer() == nil {
+		return nil, nil
+	}
+	if auth.Username != "" ||
+		auth.Password != "" ||
+		auth.Auth != "" ||
+		auth.IdentityToken != "" ||
+		auth.RegistryToken != "" {
+		return nil, errors.New("request_authorizer is mutually exclusive with registry credentials")
+	}
+	requestAuthorizer := auth.GetRequestAuthorizer()
+	name := strings.TrimSpace(requestAuthorizer.GetName())
+	if name == "" {
+		return nil, errors.New("request_authorizer.name is required")
+	}
+	if len(requestAuthorizer.GetCredentialContext()) > maxCredentialContextSize {
+		return nil, fmt.Errorf(
+			"request_authorizer.credential_context exceeds %d bytes",
+			maxCredentialContextSize,
+		)
+	}
+	return &RequestAuthorizerConfig{
+		Name:              name,
+		CredentialContext: bytes.Clone(requestAuthorizer.GetCredentialContext()),
+	}, nil
+}
+
+func (c *CRIImageService) requestSigningOptions(
+	namedRef distribution.Named,
+	requestAuthorizer *RequestAuthorizerConfig,
+) (*config.RequestSigningOptions, error) {
+	if requestAuthorizer == nil {
+		return nil, nil
+	}
+	signer, ok := c.requestAuthorizers[requestAuthorizer.Name]
+	if !ok {
+		return nil, fmt.Errorf("request authorizer %q is not configured", requestAuthorizer.Name)
+	}
+	return &config.RequestSigningOptions{
+		Hosts:             []string{distribution.Domain(namedRef)},
+		Signer:            signer,
+		CredentialContext: bytes.Clone(requestAuthorizer.CredentialContext),
+	}, nil
 }
 
 // ParseAuth parses AuthConfig and returns username and password/secret required by containerd.
@@ -506,7 +575,7 @@ func hostDirFromRoots(roots []string) func(string) (string, error) {
 }
 
 // registryHosts is the registry hosts to be used by the resolver.
-func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(host string) (string, string, error), updateClientFn config.UpdateClientFunc) docker.RegistryHosts {
+func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(host string) (string, string, error), requestSigning *config.RequestSigningOptions, updateClientFn config.UpdateClientFunc) docker.RegistryHosts {
 	paths := filepath.SplitList(c.config.Registry.ConfigPath)
 	if len(paths) > 0 {
 		hostOptions := config.HostOptions{
@@ -518,6 +587,7 @@ func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(ho
 		hostOptions.AuthorizerOpts = []docker.AuthorizerOpt{
 			docker.WithAuthHeader(c.config.Registry.Headers),
 		}
+		hostOptions.RequestSigning = requestSigning
 
 		return config.ConfigureHosts(ctx, hostOptions)
 	}
@@ -569,6 +639,16 @@ func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(ho
 				docker.WithAuthCreds(credentials),
 				docker.WithAuthHeader(c.config.Registry.Headers),
 			)
+			if requestSigningMatchesHost(requestSigning, u.Host) {
+				authorizer, err = docker.NewRFC9421Authorizer(
+					u.Host,
+					requestSigning.Signer,
+					docker.WithRFC9421CredentialContext(requestSigning.CredentialContext),
+				)
+				if err != nil {
+					return nil, fmt.Errorf("create request authorizer for %q: %w", u.Host, err)
+				}
+			}
 
 			if u.Path == "" {
 				u.Path = "/v2"
@@ -585,6 +665,18 @@ func (c *CRIImageService) registryHosts(ctx context.Context, credentials func(ho
 		}
 		return registries, nil
 	}
+}
+
+func requestSigningMatchesHost(options *config.RequestSigningOptions, host string) bool {
+	if options == nil {
+		return false
+	}
+	for _, configuredHost := range options.Hosts {
+		if strings.EqualFold(strings.TrimSpace(configuredHost), host) {
+			return true
+		}
+	}
+	return false
 }
 
 // toRuntimeAuthConfig converts cri plugin auth config to runtime auth config.

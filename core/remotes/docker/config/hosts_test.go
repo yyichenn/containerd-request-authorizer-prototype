@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -33,6 +34,93 @@ import (
 )
 
 const allCaps = docker.HostCapabilityPull | docker.HostCapabilityResolve | docker.HostCapabilityPush | docker.HostCapabilityReferrers
+
+type testSigningContext struct{}
+
+func (testSigningContext) AccessKeyID() string  { return "TESTACCESSKEY" }
+func (testSigningContext) SessionToken() string { return "test-session-token" }
+func (testSigningContext) Date() string         { return "20260824" }
+func (testSigningContext) Region() string       { return "us-east-1" }
+func (testSigningContext) Service() string      { return "ecr" }
+func (testSigningContext) Terminal() string     { return "aws4_request" }
+
+type testMessageSigner struct{}
+
+func (testMessageSigner) NewSigningContext(context.Context, time.Time, []byte) (docker.SigningContext, error) {
+	return testSigningContext{}, nil
+}
+
+func (testMessageSigner) Sign(context.Context, docker.SigningContext, []byte) ([]byte, error) {
+	return make([]byte, 32), nil
+}
+
+func TestRequestSigningUsesExactConfiguredHost(t *testing.T) {
+	ctx := logtest.WithT(context.Background(), t)
+	signedHost := "123456789012.dkr.ecr.us-east-1.amazonaws.com"
+	resolve := ConfigureHosts(ctx, HostOptions{
+		RequestSigning: &RequestSigningOptions{
+			Hosts:  []string{signedHost},
+			Signer: testMessageSigner{},
+		},
+	})
+
+	hosts, err := resolve(signedHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://"+signedHost+"/v2/repo/manifests/latest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hosts[0].Authorizer.Authorize(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Header.Get("Signature") == "" {
+		t.Fatal("configured host was not request-signed")
+	}
+
+	unsignedHosts, err := resolve("not-ecr.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsignedReq, err := http.NewRequest(http.MethodGet, "https://not-ecr.example.com/v2/repo/manifests/latest", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unsignedHosts[0].Authorizer.Authorize(ctx, unsignedReq); err != nil {
+		t.Fatal(err)
+	}
+	if unsignedReq.Header.Get("Signature") != "" {
+		t.Fatal("unconfigured host was request-signed")
+	}
+}
+
+func TestRequestSigningOptionsFromEnvironment(t *testing.T) {
+	t.Setenv(rfc9421HostsEnv, " first.example.com,SECOND.example.com ")
+	t.Setenv(rfc9421SignerSocketEnv, " /run/containerd/rfc9421-signer.sock ")
+
+	options := requestSigningOptionsFromEnvironment()
+
+	if options == nil {
+		t.Fatal("expected request-signing options")
+	}
+	expectedHosts := []string{"first.example.com", "SECOND.example.com"}
+	if !reflect.DeepEqual(options.Hosts, expectedHosts) {
+		t.Fatalf("unexpected hosts %#v", options.Hosts)
+	}
+	if options.SignerSocket != "/run/containerd/rfc9421-signer.sock" {
+		t.Fatalf("unexpected signer socket %q", options.SignerSocket)
+	}
+}
+
+func TestRequestSigningOptionsFromEnvironmentDisabledWithoutHosts(t *testing.T) {
+	t.Setenv(rfc9421HostsEnv, " ")
+	t.Setenv(rfc9421SignerSocketEnv, "/run/containerd/rfc9421-signer.sock")
+
+	if options := requestSigningOptionsFromEnvironment(); options != nil {
+		t.Fatalf("expected request signing to be disabled, got %#v", options)
+	}
+}
 
 func TestDefaultHosts(t *testing.T) {
 	ctx := logtest.WithT(context.Background(), t)

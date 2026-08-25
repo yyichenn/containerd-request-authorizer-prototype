@@ -46,6 +46,7 @@ import (
 	csproxy "github.com/containerd/containerd/v2/core/content/proxy"
 	"github.com/containerd/containerd/v2/core/diff"
 	diffproxy "github.com/containerd/containerd/v2/core/diff/proxy"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	sbproxy "github.com/containerd/containerd/v2/core/sandbox/proxy"
 	ssproxy "github.com/containerd/containerd/v2/core/snapshots/proxy"
 	"github.com/containerd/containerd/v2/defaults"
@@ -315,8 +316,9 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 	clients := &proxyClients{}
 	for name, pp := range config.ProxyPlugins {
 		var (
-			t plugin.Type
-			f func(*grpc.ClientConn) any
+			t                 plugin.Type
+			f                 func(*grpc.ClientConn) any
+			requestAuthorizer bool
 
 			address = pp.Address
 			p       v1.Platform
@@ -346,6 +348,9 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 			f = func(conn *grpc.ClientConn) any {
 				return diffproxy.NewDiffApplier(diffapi.NewDiffClient(conn))
 			}
+		case string(plugins.RequestAuthorizerPlugin), "request-authorizer":
+			t = plugins.RequestAuthorizerPlugin
+			requestAuthorizer = true
 		default:
 			log.G(ctx).WithField("type", pp.Type).Warn("unknown proxy plugin type")
 		}
@@ -371,6 +376,9 @@ func LoadPlugins(ctx context.Context, config *srvconfig.Config) ([]plugin.Regist
 				ic.Meta.Exports = exports
 				ic.Meta.Platforms = append(ic.Meta.Platforms, p)
 				ic.Meta.Capabilities = pp.Capabilities
+				if requestAuthorizer {
+					return docker.NewUnixSocketMessageSigner(address)
+				}
 				conn, err := clients.getClient(address)
 				if err != nil {
 					return nil, err

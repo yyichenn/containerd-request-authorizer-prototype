@@ -25,6 +25,7 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/core/transfer"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
@@ -53,6 +54,7 @@ func init() {
 			plugins.ServicePlugin,  // For client
 			plugins.SnapshotPlugin, // For root directory properties
 			plugins.TransferPlugin, // For pulling image using transfer service
+			plugins.RequestAuthorizerPlugin,
 			plugins.WarningPlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (any, error) {
@@ -95,11 +97,34 @@ func init() {
 			}
 
 			options := &images.CRIImageServiceOptions{
-				Content:          mdb.ContentStore(),
-				RuntimePlatforms: map[string]images.ImagePlatform{},
-				Snapshotters:     map[string]snapshots.Snapshotter{},
-				ImageFSPaths:     map[string]string{},
-				Transferrer:      ts.(transfer.Transferrer),
+				Content:            mdb.ContentStore(),
+				RuntimePlatforms:   map[string]images.ImagePlatform{},
+				Snapshotters:       map[string]snapshots.Snapshotter{},
+				ImageFSPaths:       map[string]string{},
+				Transferrer:        ts.(transfer.Transferrer),
+				RequestAuthorizers: map[string]docker.MessageSigner{},
+			}
+
+			for _, configuredPlugin := range ic.GetAll() {
+				if configuredPlugin.Registration.Type != plugins.RequestAuthorizerPlugin {
+					continue
+				}
+				instance, err := configuredPlugin.Instance()
+				if err != nil {
+					return nil, fmt.Errorf(
+						"initialize request authorizer %q: %w",
+						configuredPlugin.Registration.ID,
+						err,
+					)
+				}
+				signer, ok := instance.(docker.MessageSigner)
+				if !ok {
+					return nil, fmt.Errorf(
+						"request authorizer %q does not implement docker.MessageSigner",
+						configuredPlugin.Registration.ID,
+					)
+				}
+				options.RequestAuthorizers[configuredPlugin.Registration.ID] = signer
 			}
 
 			ctrdCli, err := containerd.New(
